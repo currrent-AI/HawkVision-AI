@@ -16,7 +16,7 @@ const PYTHON_PATH =
 
 const MODEL_PATH =
   process.env.DRONE_MODEL_PATH ||
-  "C:/Users/lenovo/AI-Disaster-Response/server/yolo26m.pt";
+  path.join(__dirname, "..", "visdrone_person_best.pt");
 
 // ============================================================
 // PYTHON DETECTION SCRIPT

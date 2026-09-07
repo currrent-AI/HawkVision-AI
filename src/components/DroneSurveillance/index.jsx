@@ -19,6 +19,9 @@ import {
   Zap,
   Square,
   X,
+  Images,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 
 const API_URL =
@@ -125,6 +128,10 @@ function DroneSurveillance() {
   const [liveFrames, setLiveFrames] = useState([]);
   const [liveTrackMap, setLiveTrackMap] = useState({});
 
+  const [evidenceItems, setEvidenceItems] = useState([]);
+  const [evidencePreview, setEvidencePreview] = useState(null);
+  const [evidenceZoom, setEvidenceZoom] = useState(1);
+
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState(null);
 
@@ -162,6 +169,7 @@ function DroneSurveillance() {
 
   const liveFramesRef = useRef([]);
   const liveTrackMapRef = useRef({});
+  const evidenceItemsRef = useRef([]);
 
   const videoWidthRef = useRef(0);
   const videoHeightRef = useRef(0);
@@ -259,6 +267,8 @@ function DroneSurveillance() {
 
     setLiveFrames([]);
     setLiveTrackMap({});
+    evidenceItemsRef.current = [];
+    setEvidenceItems([]);
     setAiData(null);
     setAnalyzeError(null);
     setSelectedTrackId(null);
@@ -374,6 +384,24 @@ function DroneSurveillance() {
             setLiveFrames([...liveFramesRef.current]);
             setLiveTrackMap(nextMap);
 
+            if (Array.isArray(data.evidence) && data.evidence.length > 0) {
+              const mergedEvidence = [...evidenceItemsRef.current];
+
+              data.evidence.forEach((item) => {
+                if (!item?.fileName) return;
+
+                if (!mergedEvidence.some((existing) => existing.fileName === item.fileName)) {
+                  mergedEvidence.push({
+                    ...item,
+                    url: `${API_URL}/evidence/${encodeURIComponent(item.fileName)}`,
+                  });
+                }
+              });
+
+              evidenceItemsRef.current = mergedEvidence.slice(-60);
+              setEvidenceItems([...evidenceItemsRef.current]);
+            }
+
             if (
               !selectedTrackIdRef.current &&
               Array.isArray(data.victims) &&
@@ -408,6 +436,21 @@ function DroneSurveillance() {
 
             setLiveFrames([...liveFramesRef.current]);
             setLiveTrackMap(nextMap);
+
+            if (Array.isArray(data.evidence) && data.evidence.length > 0) {
+              const mergedEvidence = [...evidenceItemsRef.current];
+              data.evidence.forEach((item) => {
+                if (!item?.fileName) return;
+                if (!mergedEvidence.some((existing) => existing.fileName === item.fileName)) {
+                  mergedEvidence.push({
+                    ...item,
+                    url: `${API_URL}/evidence/${encodeURIComponent(item.fileName)}`,
+                  });
+                }
+              });
+              evidenceItemsRef.current = mergedEvidence.slice(-60);
+              setEvidenceItems([...evidenceItemsRef.current]);
+            }
 
             if (
               !selectedTrackIdRef.current &&
@@ -964,7 +1007,7 @@ function DroneSurveillance() {
 
     // Match AI detections to the ACTUAL video playback position.
     // Never render the newest event merely because it arrived last.
-    const tolerance = 0.75;
+    const tolerance = 1.25;
     let bestFrame = null;
     let bestDifference = Infinity;
 
@@ -1094,6 +1137,21 @@ function DroneSurveillance() {
       ) || null
     );
   }, [activeTracks, selectedTrackId]);
+
+  // ------------------------------------------------------------
+  // VICTIM EVIDENCE ACTIONS
+  // ------------------------------------------------------------
+
+  const openEvidencePreview = (item) => {
+    if (!item?.url) return;
+    setEvidencePreview(item);
+    setEvidenceZoom(1);
+  };
+
+  const closeEvidencePreview = () => {
+    setEvidencePreview(null);
+    setEvidenceZoom(1);
+  };
 
   // ------------------------------------------------------------
   // CLEANUP
@@ -1770,6 +1828,164 @@ function DroneSurveillance() {
             />
 
           </div>
+
+          {/* ==================================================
+              VICTIM EVIDENCE GALLERY
+          ================================================== */}
+
+          <div className="rounded-xl border border-[#1D304D] bg-[#0B1425] p-4">
+
+            <div className="mb-4 flex items-center justify-between">
+
+              <div className="flex items-center gap-2">
+                <Images size={15} className="text-[#3B82F6]" />
+                <p className="text-[11px] font-bold tracking-[0.18em] text-[#8FA4B8]">
+                  VICTIM EVIDENCE
+                </p>
+              </div>
+
+              <span className="text-[10px] font-bold text-[#8FA4B8]">
+                {evidenceItems.length} CAPTURED
+              </span>
+
+            </div>
+
+            {evidenceItems.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-[#1D304D] py-8 text-center">
+                <Images size={24} className="mx-auto mb-3 text-[#475569]" />
+                <p className="text-xs font-semibold text-[#64748B]">
+                  No evidence captured yet
+                </p>
+                <p className="mt-1 text-[10px] text-[#475569]">
+                  Confirmed drone detections will be saved here automatically.
+                </p>
+              </div>
+            ) : (
+              <div className="grid max-h-[360px] grid-cols-2 gap-3 overflow-y-auto pr-1 sm:grid-cols-3">
+                {evidenceItems.map((item) => (
+                  <div
+                    key={item.fileName}
+                    className="group overflow-hidden rounded-lg border border-[#1D304D] bg-[#080F1E]"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => openEvidencePreview(item)}
+                      className="relative block aspect-square w-full overflow-hidden bg-black text-left"
+                      title="Click to zoom evidence"
+                    >
+                      <img
+                        src={item.url}
+                        alt={`Drone evidence ${item.id || "person"}`}
+                        className="h-full w-full object-contain transition duration-300 group-hover:scale-105"
+                        loading="lazy"
+                      />
+                      <div className="absolute left-2 top-2 rounded bg-black/75 px-2 py-1 text-[9px] font-black text-white">
+                        {item.id || "PERSON"}
+                      </div>
+                      <div className="absolute bottom-2 right-2 rounded-md border border-white/10 bg-black/75 px-2 py-1 text-[8px] font-bold text-white opacity-0 transition group-hover:opacity-100">
+                        CLICK TO ZOOM
+                      </div>
+                    </button>
+
+                    <div className="p-2">
+                      <div className="flex items-center justify-between text-[9px]">
+                        <span className="font-bold text-[#8FA4B8]">
+                          {formatPercent(item.confidence)}
+                        </span>
+                        <span className="text-[#64748B]">
+                          {formatTime(Number(item.timestamp || 0))}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-[8px] font-semibold tracking-wide text-[#475569]">
+                        {item.id || "PERSON"} · DRONE CAPTURE
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {evidenceItems.length > 0 && (
+              <p className="mt-3 text-[9px] leading-4 text-[#64748B]">
+                Evidence is captured automatically from confirmed drone detections. Click any captured person to open a larger view and zoom in without leaving Drone Surveillance.
+              </p>
+            )}
+
+          </div>
+
+          {evidencePreview && (
+            <div
+              className="fixed inset-0 z-[100] flex items-center justify-center bg-black/85 p-4 backdrop-blur-sm"
+              onClick={closeEvidencePreview}
+              role="dialog"
+              aria-modal="true"
+              aria-label="Drone evidence preview"
+            >
+              <div
+                className="relative flex h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[#1D304D] bg-[#080F1E] shadow-2xl"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="flex items-center justify-between border-b border-[#1D304D] bg-[#0B1425] px-4 py-3">
+                  <div>
+                    <p className="text-[10px] font-black tracking-[0.2em] text-[#3B82F6]">
+                      DRONE EVIDENCE · {evidencePreview.id || "PERSON"}
+                    </p>
+                    <p className="mt-1 text-[9px] text-[#64748B]">
+                      {formatPercent(evidencePreview.confidence)} confidence · {formatTime(Number(evidencePreview.timestamp || 0))}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setEvidenceZoom((value) => Math.max(1, value - 0.25))}
+                      className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#1D304D] bg-[#111C31] text-[#8FA4B8] hover:text-white"
+                      title="Zoom out"
+                    >
+                      <ZoomOut size={15} />
+                    </button>
+                    <span className="min-w-[48px] text-center text-[9px] font-bold text-[#8FA4B8]">
+                      {Math.round(evidenceZoom * 100)}%
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setEvidenceZoom((value) => Math.min(4, value + 0.25))}
+                      className="flex h-9 w-9 items-center justify-center rounded-lg border border-[#1D304D] bg-[#111C31] text-[#8FA4B8] hover:text-white"
+                      title="Zoom in"
+                    >
+                      <ZoomIn size={15} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={closeEvidencePreview}
+                      className="ml-1 flex h-9 w-9 items-center justify-center rounded-lg border border-[#EF3340]/40 bg-[#EF3340]/10 text-[#EF3340] hover:bg-[#EF3340]/20"
+                      title="Close"
+                    >
+                      <X size={16} />
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex flex-1 items-center justify-center overflow-auto bg-black p-4">
+                  <img
+                    src={evidencePreview.url}
+                    alt={`Expanded drone evidence ${evidencePreview.id || "person"}`}
+                    className="max-h-full max-w-full object-contain transition-transform duration-200"
+                    style={{ transform: `scale(${evidenceZoom})` }}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between border-t border-[#1D304D] bg-[#0B1425] px-4 py-2">
+                  <span className="text-[8px] font-bold tracking-[0.15em] text-[#475569]">
+                    HAWKVISION · DRONE VICTIM EVIDENCE
+                  </span>
+                  <span className="text-[8px] font-bold text-[#64748B]">
+                    ESC TO CLOSE · CLICK OUTSIDE TO CLOSE
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
 
         </div>
 

@@ -14,9 +14,9 @@ from ultralytics import YOLO
 # aerial/disaster footage occupy more pixels before YOLO sees them.
 #
 # Pipeline:
-#   frame -> 3x3 overlapping tiles -> YOLO26m person detection
-#         -> merge duplicate boxes -> lightweight tracking
-#         -> temporal confirmation (suppress one-frame false positives)
+#   frame -> camera motion compensation -> 4x4 overlapping tiles
+#         -> VisDrone small-person detection -> merge duplicate boxes
+#         -> motion-aware tracking -> temporal confirmation
 #         -> HawkVision JSON + annotated MJPEG
 #
 # NOTE: A COCO pretrained YOLO model detects PERSON. HawkVision
@@ -27,7 +27,7 @@ from ultralytics import YOLO
 # ------------------------------------------------------------
 # DETECTION SETTINGS
 # ------------------------------------------------------------
-CONFIDENCE_THRESHOLD = 0.20
+CONFIDENCE_THRESHOLD = 0.12
 IOU_THRESHOLD = 0.45
 IMAGE_SIZE = 1280
 MAX_DETECTIONS = 100
@@ -35,11 +35,14 @@ PERSON_CLASS_ID = 0
 
 # ------------------------------------------------------------
 # SLICING SETTINGS
-# Exactly 3x3 overlapping tiles. This avoids the slowdown that can
-# happen when generic sliding-window code is used with more tiles.
-TILE_ROWS = 3
-TILE_COLS = 3
-TILE_OVERLAP = 0.20
+# Small-person aerial detection: 4x4 overlapping tiles.
+# More tiles make distant people occupy more pixels before YOLO sees them.
+# This is the practical equivalent of defining a usable drone detection
+# range: we improve detection by object scale in the image rather than
+# pretending that one fixed altitude works for every camera/lens.
+TILE_ROWS = 4
+TILE_COLS = 4
+TILE_OVERLAP = 0.25
 
 # Recorded-video live analysis: emit at most ~2 AI frames/sec.
 # This prevents the Python process from racing far ahead of the HTML5 video.
@@ -61,9 +64,170 @@ TRACK_STRONG_CONF = 0.50
 # The detector is sliced; therefore detections are merged first and
 # then tracked in the original full-frame coordinate system.
 # ------------------------------------------------------------
-TRACK_MAX_DISTANCE = 110
-TRACK_MAX_MISSED = 3
-TRACK_IOU_MATCH = 0.08
+TRACK_MAX_DISTANCE = 140
+TRACK_MAX_MISSED = 6
+TRACK_IOU_MATCH = 0.05
+
+# ------------------------------------------------------------
+# CAMERA MOTION COMPENSATION (CMC)
+# ORB estimates how the drone camera moved between frames.
+# Existing tracks are transformed into the new camera position
+# before person matching. This is especially useful for aerial
+# footage where the whole scene shifts as the drone moves.
+# ------------------------------------------------------------
+CMC_MAX_FEATURES = 500
+CMC_MIN_MATCHES = 8
+CMC_RANSAC_THRESHOLD = 4.0
+CMC_MAX_SCALE_CHANGE = 1.35
+
+# ------------------------------------------------------------
+# EVIDENCE CAPTURE SETTINGS
+# Save a small number of useful confirmed-person crops for the
+# Drone Surveillance evidence gallery.
+# ------------------------------------------------------------
+EVIDENCE_SAVE_INTERVAL = 5.0
+EVIDENCE_CONFIDENCE_IMPROVEMENT = 0.05
+EVIDENCE_PADDING = 0.30
+EVIDENCE_JPEG_QUALITY = 92
+EVIDENCE_STATE = {}
+
+
+
+# ============================================================
+# EVIDENCE CAPTURE
+# ============================================================
+
+def reset_evidence_state():
+    EVIDENCE_STATE.clear()
+
+
+def _evidence_directory(source):
+    """Store evidence beside the uploaded drone video."""
+    source_dir = os.path.dirname(os.path.abspath(source))
+    evidence_dir = os.path.join(source_dir, "evidence")
+    os.makedirs(evidence_dir, exist_ok=True)
+    return evidence_dir
+
+
+def _safe_evidence_name(value):
+    value = str(value or "source")
+    return "".join(
+        char if char.isalnum() or char in ("-", "_") else "_"
+        for char in value
+    )[:80] or "source"
+
+
+def save_detection_evidence(frame, detections, source, timestamp):
+    """
+    Save clean crops for confirmed real detections.
+
+    We avoid saving every sampled frame. A track gets a first evidence
+    image immediately, then another only when enough time has passed or
+    confidence improves meaningfully. This keeps the gallery useful
+    instead of filling it with duplicates.
+    """
+    if frame is None or frame.size == 0 or not detections:
+        return []
+
+    try:
+        evidence_dir = _evidence_directory(source)
+    except Exception as error:
+        print(
+            f"[EVIDENCE] directory error: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+
+    frame_height, frame_width = frame.shape[:2]
+    source_name = _safe_evidence_name(os.path.splitext(os.path.basename(source))[0])
+    timestamp_value = float(timestamp or 0.0)
+    saved = []
+
+    for detection in detections:
+        track_id = detection.get("id")
+        if not track_id:
+            continue
+
+        confidence = float(detection.get("confidence", 0.0)) / 100.0
+        state = EVIDENCE_STATE.get(str(track_id))
+
+        should_save = (
+            state is None
+            or confidence >= state.get("best_confidence", 0.0) + EVIDENCE_CONFIDENCE_IMPROVEMENT
+            or timestamp_value - state.get("last_saved_at", -999.0) >= EVIDENCE_SAVE_INTERVAL
+        )
+
+        if not should_save:
+            continue
+
+        bbox = detection.get("bbox") or {}
+        x = int(bbox.get("x", 0))
+        y = int(bbox.get("y", 0))
+        width = int(bbox.get("width", 0))
+        height = int(bbox.get("height", 0))
+
+        if width <= 0 or height <= 0:
+            continue
+
+        # Add context around the person so the image remains useful for
+        # a second-pass victim/person analysis.
+        pad_x = int(width * EVIDENCE_PADDING)
+        pad_y = int(height * EVIDENCE_PADDING)
+
+        x1 = max(0, x - pad_x)
+        y1 = max(0, y - pad_y)
+        x2 = min(frame_width, x + width + pad_x)
+        y2 = min(frame_height, y + height + pad_y)
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        crop = frame[y1:y2, x1:x2]
+        if crop is None or crop.size == 0:
+            continue
+
+        timestamp_label = f"{timestamp_value:08.2f}".replace(".", "_")
+        filename = (
+            f"{source_name}_{_safe_evidence_name(track_id)}_"
+            f"{timestamp_label}_{int(confidence * 1000):03d}.jpg"
+        )
+        output_path = os.path.join(evidence_dir, filename)
+
+        try:
+            ok = cv2.imwrite(
+                output_path,
+                crop,
+                [cv2.IMWRITE_JPEG_QUALITY, EVIDENCE_JPEG_QUALITY],
+            )
+        except Exception as error:
+            print(
+                f"[EVIDENCE] save error for {track_id}: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            continue
+
+        if not ok:
+            continue
+
+        EVIDENCE_STATE[str(track_id)] = {
+            "best_confidence": max(
+                confidence,
+                state.get("best_confidence", 0.0) if state else 0.0,
+            ),
+            "last_saved_at": timestamp_value,
+        }
+
+        saved.append({
+            "id": str(track_id),
+            "fileName": filename,
+            "timestamp": round(timestamp_value, 2),
+            "confidence": round(confidence * 100.0, 1),
+            "source": os.path.basename(source),
+        })
+
+    return saved
 
 
 # ============================================================
@@ -98,7 +262,7 @@ def is_person_class(model, class_id):
     try:
         class_id = int(class_id)
         class_name = str(model.names[class_id]).lower().strip()
-        return class_name in ("person", "victim", "human")
+        return class_name in ("person", "victim", "human", "pedestrian", "people")
     except Exception:
         return int(class_id) == PERSON_CLASS_ID
 
@@ -116,7 +280,7 @@ def get_person_class_ids(model):
             items = enumerate(names)
 
         for class_id, name in items:
-            if str(name).lower().strip() in ("person", "victim", "human"):
+            if str(name).lower().strip() in ("person", "victim", "human", "pedestrian", "people"):
                 ids.append(int(class_id))
     except Exception:
         pass
@@ -202,7 +366,7 @@ def _tile_start_positions(full_size, tile_size, count):
 
 
 def generate_tiles(frame):
-    """Create a 3x3 set of overlapping crops in full-frame coordinates."""
+    """Create a 4x4 set of overlapping crops in full-frame coordinates."""
     if frame is None or frame.size == 0:
         return []
 
@@ -325,8 +489,8 @@ def merge_sliced_detections(raw_detections):
 
 def sliced_detect(model, frame):
     """
-    Run YOLO on 3x3 overlapping crops and map all boxes back to the
-    original frame. Only person class is requested from YOLO.
+    Run YOLO on 4x4 overlapping crops and map all boxes back to the
+    original frame. This improves small/distant person detection. Only person class is requested from YOLO.
     """
     if frame is None or frame.size == 0:
         return []
@@ -450,21 +614,26 @@ def sliced_detect(model, frame):
 
 class PersonTracker:
     """
-    Simple frame-to-frame tracker in original-frame coordinates.
-    It keeps IDs stable after sliced detections are merged, and counts
-    how many frames each track has been observed on so one-frame false
-    positives can be suppressed (temporal confirmation). It never
-    re-emits boxes for frames where YOLO found nothing, so it cannot
-    invent people.
+    Motion-aware frame-to-frame tracker.
+
+    ORB camera-motion compensation estimates the camera movement from
+    the previous frame to the current frame. Existing person tracks are
+    transformed with that motion before matching the new YOLO detections.
+
+    The tracker still reports only real YOLO detections. It does not
+    invent a person when the detector finds nothing.
     """
 
     def __init__(self):
         self.next_id = 1
         self.tracks = {}
+        self.prev_gray = None
+        self.orb = cv2.ORB_create(nfeatures=CMC_MAX_FEATURES)
 
     def reset(self):
         self.next_id = 1
         self.tracks = {}
+        self.prev_gray = None
 
     @staticmethod
     def center(box):
@@ -487,7 +656,194 @@ class PersonTracker:
             or float(confidence) >= TRACK_STRONG_CONF
         )
 
-    def update(self, detections):
+    @staticmethod
+    def _transform_box(box, matrix, frame_width, frame_height):
+        """Transform a bounding box using a 2x3 affine motion matrix."""
+        x1, y1, x2, y2 = box
+
+        corners = np.float32([
+            [x1, y1],
+            [x2, y1],
+            [x2, y2],
+            [x1, y2],
+        ]).reshape(-1, 1, 2)
+
+        transformed = cv2.transform(corners, matrix).reshape(-1, 2)
+
+        new_x1 = max(
+            0.0,
+            min(float(frame_width - 1), float(np.min(transformed[:, 0])))
+        )
+        new_y1 = max(
+            0.0,
+            min(float(frame_height - 1), float(np.min(transformed[:, 1])))
+        )
+        new_x2 = max(
+            0.0,
+            min(float(frame_width), float(np.max(transformed[:, 0])))
+        )
+        new_y2 = max(
+            0.0,
+            min(float(frame_height), float(np.max(transformed[:, 1])))
+        )
+
+        if new_x2 <= new_x1 or new_y2 <= new_y1:
+            return box
+
+        return (new_x1, new_y1, new_x2, new_y2)
+
+    def _estimate_camera_motion(self, frame):
+        """
+        Estimate previous-frame -> current-frame affine motion.
+
+        ORB feature matching is used because drone footage can shift,
+        rotate, and slightly scale the whole scene between frames.
+        If matching is unreliable, no transform is applied.
+        """
+        if frame is None or frame.size == 0:
+            return None
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        if self.prev_gray is None:
+            self.prev_gray = gray
+            return None
+
+        try:
+            prev_keypoints, prev_descriptors = self.orb.detectAndCompute(
+                self.prev_gray,
+                None,
+            )
+            curr_keypoints, curr_descriptors = self.orb.detectAndCompute(
+                gray,
+                None,
+            )
+
+            if (
+                prev_descriptors is None
+                or curr_descriptors is None
+                or len(prev_keypoints) < CMC_MIN_MATCHES
+                or len(curr_keypoints) < CMC_MIN_MATCHES
+            ):
+                self.prev_gray = gray
+                return None
+
+            matcher = cv2.BFMatcher(
+                cv2.NORM_HAMMING,
+                crossCheck=False,
+            )
+
+            knn_matches = matcher.knnMatch(
+                prev_descriptors,
+                curr_descriptors,
+                k=2,
+            )
+
+            good_matches = []
+
+            for pair in knn_matches:
+                if len(pair) < 2:
+                    continue
+
+                first, second = pair
+
+                if first.distance < 0.75 * second.distance:
+                    good_matches.append(first)
+
+            if len(good_matches) < CMC_MIN_MATCHES:
+                self.prev_gray = gray
+                return None
+
+            prev_points = np.float32([
+                prev_keypoints[m.queryIdx].pt
+                for m in good_matches
+            ])
+
+            curr_points = np.float32([
+                curr_keypoints[m.trainIdx].pt
+                for m in good_matches
+            ])
+
+            matrix, inliers = cv2.estimateAffinePartial2D(
+                prev_points,
+                curr_points,
+                method=cv2.RANSAC,
+                ransacReprojThreshold=CMC_RANSAC_THRESHOLD,
+            )
+
+            self.prev_gray = gray
+
+            if matrix is None or inliers is None:
+                return None
+
+            inlier_count = int(inliers.ravel().sum())
+
+            if inlier_count < CMC_MIN_MATCHES:
+                return None
+
+            scale_x = math.hypot(
+                float(matrix[0, 0]),
+                float(matrix[1, 0]),
+            )
+            scale_y = math.hypot(
+                float(matrix[0, 1]),
+                float(matrix[1, 1]),
+            )
+
+            if (
+                scale_x <= 0.0
+                or scale_y <= 0.0
+                or scale_x > CMC_MAX_SCALE_CHANGE
+                or scale_y > CMC_MAX_SCALE_CHANGE
+                or scale_x < (1.0 / CMC_MAX_SCALE_CHANGE)
+                or scale_y < (1.0 / CMC_MAX_SCALE_CHANGE)
+            ):
+                return None
+
+            print(
+                f"[CMC] matches={len(good_matches)} "
+                f"inliers={inlier_count} "
+                f"dx={matrix[0, 2]:.1f} "
+                f"dy={matrix[1, 2]:.1f} "
+                f"scale={scale_x:.3f}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            return matrix
+
+        except Exception as error:
+            self.prev_gray = gray
+
+            print(
+                f"[CMC] motion estimation skipped: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            return None
+
+    def update(self, detections, frame=None):
+        camera_motion = self._estimate_camera_motion(frame)
+
+        if (
+            frame is not None
+            and camera_motion is not None
+            and self.tracks
+        ):
+            frame_height, frame_width = frame.shape[:2]
+
+            for track in self.tracks.values():
+                transformed_box = self._transform_box(
+                    track["box"],
+                    camera_motion,
+                    frame_width,
+                    frame_height,
+                )
+
+                track["box"] = transformed_box
+                track["center"] = self.center(transformed_box)
+
         for track in self.tracks.values():
             track["missed"] += 1
 
@@ -500,7 +856,10 @@ class PersonTracker:
         for track_id, track in self.tracks.items():
             track_box = track["box"]
             track_center = track["center"]
-            scale = max(40.0, self.diagonal(track_box) * 1.5)
+            scale = max(
+                40.0,
+                self.diagonal(track_box) * 1.5,
+            )
 
             for detection_index, detection in enumerate(detections):
                 detection_box = detection["box"]
@@ -511,13 +870,17 @@ class PersonTracker:
                     detection_center[1] - track_center[1],
                 )
 
-                overlap = box_iou(track_box, detection_box)
+                overlap = box_iou(
+                    track_box,
+                    detection_box,
+                )
 
-                # Moving drone footage can shift objects considerably.
-                # Accept either spatial proximity or modest overlap.
-                if distance <= max(TRACK_MAX_DISTANCE, scale) or overlap >= TRACK_IOU_MATCH:
-                    # Lower score is better.
+                if (
+                    distance <= max(TRACK_MAX_DISTANCE, scale)
+                    or overlap >= TRACK_IOU_MATCH
+                ):
                     score = distance - (overlap * 150.0)
+
                     candidates.append(
                         (score, track_id, detection_index)
                     )
@@ -535,6 +898,7 @@ class PersonTracker:
             detection = detections[detection_index]
             box = detection["box"]
             center = self.center(box)
+
             hits = self.tracks[track_id].get("hits", 0) + 1
 
             self.tracks[track_id].update({
@@ -585,8 +949,6 @@ class PersonTracker:
         for track_id in list(self.tracks.keys()):
             if self.tracks[track_id]["missed"] > TRACK_MAX_MISSED:
                 del self.tracks[track_id]
-
-
 TRACKER = PersonTracker()
 
 
@@ -638,7 +1000,7 @@ def detect_frame(model, frame, tracking=True):
     sliced_detections = sliced_detect(model, frame)
 
     if tracking:
-        sliced_detections = TRACKER.update(sliced_detections)
+        sliced_detections = TRACKER.update(sliced_detections, frame=frame)
         # Temporal confirmation: only report tracks observed on enough
         # frames (or with strong confidence). One-frame flickers on
         # debris/water are suppressed here, never faked into victims.
@@ -856,9 +1218,9 @@ def analyze_video(model, video_path):
 
     return {
         "success": True,
-        "model": "YOLO26m",
+        "model": "VisDrone Person YOLO",
         "mode": "recorded",
-        "detectionMethod": "3x3 sliced inference",
+        "detectionMethod": "VisDrone person detection + 4x4 sliced inference + CMC + tracking",
         "totalFrames": total_frames,
         "processedFrames": processed_frames,
         "victimsDetected": len(detected_ids),
@@ -900,6 +1262,7 @@ def live_stream(model, source):
         return
 
     reset_tracker()
+    reset_evidence_state()
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     if fps <= 1.0 or fps > 240.0:
@@ -913,7 +1276,7 @@ def live_stream(model, source):
         "type": "connected",
         "mode": "live",
         "source": "recorded_video" if is_recorded_file else "drone_camera",
-        "detectionMethod": "3x3 sliced inference",
+        "detectionMethod": "VisDrone person detection + 4x4 sliced inference + CMC + tracking",
         "fps": fps,
     })
 
@@ -950,6 +1313,13 @@ def live_stream(model, source):
         try:
             _, detections = detect_frame(model, frame, tracking=True)
 
+            evidence = save_detection_evidence(
+                frame,
+                detections,
+                source,
+                video_time if is_recorded_file else (time.monotonic() - wall_start),
+            )
+
             high = sum(1 for d in detections if d["risk"] == "HIGH")
             medium = sum(1 for d in detections if d["risk"] == "MEDIUM")
             low = sum(1 for d in detections if d["risk"] == "LOW")
@@ -961,6 +1331,7 @@ def live_stream(model, source):
                 "timestamp": video_time if is_recorded_file else (time.monotonic() - wall_start),
                 "videoTime": video_time if is_recorded_file else None,
                 "victims": detections,
+                "evidence": evidence,
                 "counts": {
                     "total": len(detections),
                     "high": high,

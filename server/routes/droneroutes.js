@@ -292,6 +292,82 @@ router.get("/videos", (req, res) => {
 });
 
 // ============================================================
+// SERVE VICTIM EVIDENCE IMAGE
+// Evidence is stored inside each drone video's evidence folder.
+// ============================================================
+
+router.get("/evidence/:fileName", (req, res) => {
+  const requested = path.basename(req.params.fileName || "");
+
+  if (!requested || requested !== req.params.fileName) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid evidence filename",
+    });
+  }
+
+  try {
+    let foundPath = null;
+    const videoFiles = fs.readdirSync(uploadDir, { withFileTypes: true });
+
+    for (const entry of videoFiles) {
+      if (!entry.isFile()) continue;
+
+      const videoBase = path.join(uploadDir, entry.name);
+      const evidenceDir = path.join(uploadDir, "evidence", entry.name);
+
+      // Current Python implementation stores evidence at:
+      // uploads/drone/<video-name>/evidence/<image>.jpg
+      const nestedDir = path.join(videoBase, "evidence");
+      const candidates = [nestedDir, evidenceDir];
+
+      for (const dir of candidates) {
+        const candidate = path.join(dir, requested);
+        if (candidate.startsWith(path.resolve(dir) + path.sep) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+          foundPath = candidate;
+          break;
+        }
+      }
+
+      if (foundPath) break;
+    }
+
+    // Fallback: recursively search only inside the drone upload directory.
+    if (!foundPath) {
+      const stack = [uploadDir];
+      while (stack.length && !foundPath) {
+        const current = stack.pop();
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+          const fullPath = path.join(current, entry.name);
+          if (entry.isDirectory()) {
+            stack.push(fullPath);
+          } else if (entry.isFile() && entry.name === requested) {
+            foundPath = fullPath;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!foundPath) {
+      return res.status(404).json({
+        success: false,
+        message: "Evidence image not found",
+      });
+    }
+
+    res.type(path.extname(foundPath) || ".jpg");
+    return res.sendFile(path.resolve(foundPath));
+  } catch (error) {
+    console.error("Evidence image error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to load evidence image",
+    });
+  }
+});
+
+// ============================================================
 // SERVE RECORDED VIDEO
 // Supports browser seeking with HTTP Range
 // ============================================================
