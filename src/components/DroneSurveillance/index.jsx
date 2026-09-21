@@ -925,7 +925,7 @@ function DroneSurveillance() {
 
     setDroneError(null);
 
-    const feedUrl = `${API_URL}/live/feed?t=${Date.now()}`;
+    const feedUrl = `${API_URL}/live/drone/feed?t=${Date.now()}`;
 
     setDroneFeedUrl(feedUrl);
     setDroneConnected(true);

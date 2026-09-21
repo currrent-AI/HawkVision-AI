@@ -54,6 +54,18 @@ const createDisasterIcon = (severity = "MEDIUM") => {
   });
 };
 
+const safeIcon = L.divIcon({
+  className: "hawk-disaster-marker-wrapper",
+  html: `
+    <div class="hawk-disaster-marker safe">
+      <span>✓</span>
+    </div>
+  `,
+  iconSize: [38, 38],
+  iconAnchor: [19, 19],
+  popupAnchor: [0, -20],
+});
+
 const userLocationIcon = L.divIcon({
   className: "hawk-user-location-wrapper",
   html: `
@@ -163,61 +175,35 @@ const LocationButton = ({ onLocationFound, locating }) => {
 };
 
 // =====================================================
-// DEFAULT DEMO DISASTER MARKERS
+// AUTOMATIC FLOOD MONITORING
 // =====================================================
+//
+// These are the same locations monitored by FloodPrediction.
+// The map calls the existing backend prediction endpoint directly,
+// so markers are generated from the actual flood-risk result.
+// No hardcoded disaster markers are used.
+//
 
-const demoDisasters = [
-  {
-    id: "demo-1",
-    type: "Flood",
-    title: "Flood Risk Area",
-    severity: "CRITICAL",
-    location: "Islamabad",
-    latitude: 33.6844,
-    longitude: 73.0479,
-    status: "ACTIVE",
-  },
-  {
-    id: "demo-2",
-    type: "Flood",
-    title: "Flood Warning",
-    severity: "HIGH",
-    location: "Lahore",
-    latitude: 31.5204,
-    longitude: 74.3587,
-    status: "ACTIVE",
-  },
-  {
-    id: "demo-3",
-    type: "Landslide",
-    title: "Landslide Warning",
-    severity: "HIGH",
-    location: "Murree",
-    latitude: 33.9073,
-    longitude: 73.3903,
-    status: "ACTIVE",
-  },
-  {
-    id: "demo-4",
-    type: "Flood",
-    title: "Flood Monitoring",
-    severity: "MEDIUM",
-    location: "Multan",
-    latitude: 30.1575,
-    longitude: 71.5249,
-    status: "MONITORING",
-  },
-  {
-    id: "demo-5",
-    type: "Flood",
-    title: "Water Level Warning",
-    severity: "MEDIUM",
-    location: "Hyderabad",
-    latitude: 25.396,
-    longitude: 68.3578,
-    status: "MONITORING",
-  },
+const FLOOD_LOCATIONS = [
+  { name: "Lahore", latitude: 31.5204, longitude: 74.3587 },
+  { name: "Swat", latitude: 35.2227, longitude: 72.4258 },
+  { name: "Islamabad", latitude: 33.6844, longitude: 73.0479 },
+  { name: "Rawalpindi", latitude: 33.5651, longitude: 73.0169 },
+  { name: "Murree", latitude: 33.9073, longitude: 73.3903 },
+  { name: "Peshawar", latitude: 34.0151, longitude: 71.5249 },
+  { name: "Karachi", latitude: 24.8607, longitude: 67.0011 },
 ];
+
+const normalizeRisk = (risk) => {
+  const level = String(risk || "").trim().toUpperCase();
+
+  if (level === "CRITICAL") return "CRITICAL";
+  if (level === "HIGH" || level === "WARNING") return "HIGH";
+  if (level === "MODERATE" || level === "MEDIUM") return "MODERATE";
+  if (level === "LOW") return "LOW";
+
+  return "";
+};
 
 // =====================================================
 // NORMALIZE DISASTER DATA
@@ -265,6 +251,16 @@ const normalizeDisaster = (item, index) => {
       item.message ||
       item.description ||
       "",
+    percentage:
+      item.percentage ??
+      item.riskProbability ??
+      null,
+    rainfall: item.rainfall ?? null,
+    waterLevel: item.waterLevel ?? null,
+    temperature: item.temperature ?? null,
+    humidity: item.humidity ?? null,
+    weatherCondition: item.weatherCondition ?? null,
+    timestamp: item.timestamp ?? null,
   };
 };
 
@@ -283,18 +279,137 @@ const DisasterMap = ({
   const [locating, setLocating] =
     useState(false);
 
+  const API_BASE =
+    import.meta.env.VITE_API_BASE_URL ||
+    "http://localhost:5000";
+
+  const [automaticFloodData, setAutomaticFloodData] =
+    useState([]);
+
+  const [autoFloodLoading, setAutoFloodLoading] =
+    useState(true);
+
+  const [autoFloodError, setAutoFloodError] =
+    useState(null);
+
+  const fetchAutomaticFloodData = async () => {
+    setAutoFloodLoading(true);
+    setAutoFloodError(null);
+
+    try {
+      const results = await Promise.allSettled(
+        FLOOD_LOCATIONS.map(async (place) => {
+          const response = await fetch(
+            `${API_BASE}/api/flood/predict`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                location: place.name,
+              }),
+            }
+          );
+
+          const result = await response.json();
+
+          if (!response.ok || !result.success) {
+            throw new Error(
+              result.error ||
+                result.message ||
+                `Unable to predict flood risk for ${place.name}.`
+            );
+          }
+
+          const data = result.data || {};
+          const risk = normalizeRisk(data.risk);
+
+          return {
+            id: `flood-prediction-${place.name.toLowerCase()}`,
+            type: "Flood",
+            title:
+              risk === "CRITICAL"
+                ? "Critical Flood Risk"
+                : risk === "HIGH"
+                ? "Flood Warning"
+                : risk === "MODERATE"
+                ? "Flood Monitoring"
+                : "Flood Risk Monitoring",
+            severity: risk,
+            location: place.name,
+            latitude: place.latitude,
+            longitude: place.longitude,
+            status:
+              risk === "CRITICAL" || risk === "HIGH"
+                ? "ACTIVE"
+                : risk === "MODERATE"
+                ? "MONITORING"
+                : "SAFE",
+            message:
+              data.recommendation ||
+              "Automatic flood risk assessment.",
+            percentage: data.percentage ?? 0,
+            rainfall: data.rainfall ?? null,
+            waterLevel: data.waterLevel ?? null,
+            temperature: data.temperature ?? null,
+            humidity: data.humidity ?? null,
+            weatherCondition:
+              data.weatherCondition ?? null,
+            timestamp: data.timestamp ?? null,
+          };
+        })
+      );
+
+      const successful = results
+        .filter(
+          (result) => result.status === "fulfilled"
+        )
+        .map((result) => result.value)
+        .filter((item) => item.severity);
+
+      if (successful.length === 0) {
+        throw new Error(
+          "No flood prediction data is currently available."
+        );
+      }
+
+      setAutomaticFloodData(successful);
+    } catch (fetchError) {
+      console.error(
+        "Automatic flood map error:",
+        fetchError
+      );
+
+      setAutoFloodError(
+        fetchError.message ||
+          "Unable to load automatic flood predictions."
+      );
+    } finally {
+      setAutoFloodLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchAutomaticFloodData();
+
+    const interval = setInterval(() => {
+      fetchAutomaticFloodData();
+    }, 10 * 60 * 1000);
+
+    return () => clearInterval(interval);
+  }, [API_BASE]);
+
   const mapDisasters = useMemo(() => {
-    const normalized = disasters
+    // IMPORTANT: The map is driven by automatic Flood Prediction data.
+    // We intentionally do NOT merge the old `disasters` prop here because
+    // that data can contain stale/demo CRITICAL or WARNING markers.
+    // This keeps the map synchronized with the actual flood prediction API.
+    return automaticFloodData
+      .filter((item) => item && item.severity)
       .map(normalizeDisaster)
       .filter(Boolean);
-
-    // Use real backend data when available.
-    // Otherwise show demo markers so the map
-    // doesn't look empty during presentation.
-    return normalized.length > 0
-      ? normalized
-      : demoDisasters;
-  }, [disasters]);
+  }, [automaticFloodData]);
 
   const handleLocationFound = (location) => {
     if (location === null) {
@@ -327,7 +442,7 @@ const DisasterMap = ({
           <div>
             <h2>Disaster Monitoring Map</h2>
             <p>
-              Real-time disaster activity across
+              Automatic flood risk monitoring across
               Pakistan
             </p>
           </div>
@@ -386,9 +501,13 @@ const DisasterMap = ({
                   disaster.latitude,
                   disaster.longitude,
                 ]}
-                icon={createDisasterIcon(
-                  disaster.severity
-                )}
+                icon={
+                  disaster.severity === "LOW"
+                    ? safeIcon
+                    : createDisasterIcon(
+                        disaster.severity
+                      )
+                }
               >
                 <Popup>
                   <div className="hawk-popup">
@@ -567,6 +686,11 @@ const DisasterMap = ({
             SHELTER
           </div>
 
+          <div>
+            <span className="legend-dot safe"></span>
+            SAFE
+          </div>
+
           {userLocation && (
             <div>
               <span className="legend-dot your-location"></span>
@@ -579,15 +703,17 @@ const DisasterMap = ({
         {/* LOADING */}
         {/* =============================================== */}
 
-        {loading && (
+        {(loading || autoFloodLoading) && (
           <div className="hawk-map-overlay">
-            Loading disaster data...
+            Loading automatic flood risk data...
           </div>
         )}
 
-        {error && (
+        {(error || autoFloodError) && (
           <div className="hawk-map-error">
-            Unable to load live disaster data
+            {autoFloodError
+              ? "Automatic flood predictions unavailable"
+              : "Unable to load live disaster data"}
           </div>
         )}
       </div>
@@ -800,6 +926,10 @@ const DisasterMap = ({
           box-shadow: 0 0 8px rgba(59, 130, 246, 0.7);
         }
 
+        .legend-dot.safe {
+          background: #22C55E;
+        }
+
         .legend-dot.shelter {
           background: #22C55E;
           box-shadow: 0 0 8px rgba(34, 197, 94, 0.7);
@@ -840,6 +970,16 @@ const DisasterMap = ({
 
         .hawk-disaster-marker.warning {
           background: #F59E0B;
+        }
+
+        .hawk-disaster-marker.safe {
+          background: #22c55e;
+          border: 3px solid rgba(255, 255, 255, 0.9);
+          box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.18), 0 6px 16px rgba(0, 0, 0, 0.35);
+        }
+
+        .hawk-disaster-marker.safe span {
+          font-size: 19px;
         }
 
         .hawk-disaster-marker.moderate {
